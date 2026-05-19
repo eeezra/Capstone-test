@@ -17,11 +17,36 @@ from sklearn.preprocessing import StandardScaler
 import pandas as pd
 import os
 
+def download_shape_predictor():
+    """Download shape_predictor_68_face_landmarks.dat jika belum ada."""
+    dat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "shape_predictor_68_face_landmarks.dat")
+    if os.path.exists(dat_path):
+        return dat_path
+    
+    import urllib.request
+    import bz2
+
+    url      = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
+    bz2_path = dat_path + ".bz2"
+
+    print("⬇️ Downloading shape_predictor_68_face_landmarks.dat...")
+    urllib.request.urlretrieve(url, bz2_path)
+
+    print("📦 Extracting...")
+    with bz2.open(bz2_path, "rb") as f_in, open(dat_path, "wb") as f_out:
+        f_out.write(f_in.read())
+    os.remove(bz2_path)
+
+    print("✅ shape_predictor siap")
+    return dat_path
+
+# Jalankan sebelum BASE_DIR
+LANDMARK_DAT = download_shape_predictor()
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(BASE_DIR, "models")
 FOUNDATION_CSV = os.path.join(BASE_DIR, "foundation_mst_full_most_updated.csv")
-LANDMARK_DAT   = os.path.join(BASE_DIR, "shape_predictor_68_face_landmarks.dat")
 
 # Kolom fitur yang sama persis dengan training
 FEATURE_COLS = [
