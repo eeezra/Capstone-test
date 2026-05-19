@@ -415,7 +415,7 @@ def main():
         with st.spinner("Menganalisis wajah..."):
             result, error = run_pipeline(
                 img_rgb, detector, predictor, ensemble, scaler,
-                df_found, mst_hex_lookup, FEATURE_COLS
+                kmeans, centroids, df_found, mst_hex_lookup, FEATURE_COLS
             )
 
         if error:
