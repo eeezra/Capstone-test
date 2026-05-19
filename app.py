@@ -217,6 +217,11 @@ def filter_skin_pixels(lab_pixels):
 # ─────────────────────────────────────────────
 def get_skin_features(img_rgb, lms):
     from skimage.color import rgb2lab as skimage_rgb2lab
+    
+    # Pastikan hanya 3 channel RGB, buang alpha jika ada
+    if img_rgb.ndim == 3 and img_rgb.shape[2] == 4:
+        img_rgb = img_rgb[:, :, :3]
+    
     lab        = skimage_rgb2lab(img_rgb.astype(np.float32) / 255.0)
     all_pixels = []
     feats      = {}
@@ -356,6 +361,10 @@ def cielab_to_hex(L, a, b):
 def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
                  kmeans, centroids, df_found, mst_hex_lookup, feature_cols):
     t0 = time.time()
+
+    # Guard: pastikan RGB 3 channel
+    if img_rgb.ndim == 3 and img_rgb.shape[2] == 4:
+        img_rgb = img_rgb[:, :, :3]
 
     h, w = img_rgb.shape[:2]
     if max(h, w) > 512:
