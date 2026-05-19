@@ -82,8 +82,8 @@ FEATURE_COLS = [
 @st.cache_resource
 def load_resources():
     # MediaPipe Face Mesh
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
+    mp_face_mesh_module = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh_module.FaceMesh(
         static_image_mode=True,
         max_num_faces=1,
         refine_landmarks=True,
