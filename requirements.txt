@@ -3,8 +3,8 @@ numpy<2
 pandas
 opencv-python-headless==4.8.1.78
 opencv-contrib-python-headless==4.8.1.78
-scikit-learn
-scikit-image
+scikit-learn==1.6.1
+scikit-image==0.22.0
 scipy
 joblib
 Pillow
