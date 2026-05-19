@@ -4,51 +4,67 @@
 import streamlit as st
 import numpy as np
 import cv2
-import dlib
+import mediapipe as mp
 import joblib
 import os
 import time
+import math
 from PIL import Image
 from io import BytesIO
 from scipy.signal import wiener
-from skimage.color import rgb2lab, lab2rgb
+from skimage.color import rgb2lab
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
-import os
 
-def download_shape_predictor():
-    """Download shape_predictor_68_face_landmarks.dat jika belum ada."""
-    dat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "shape_predictor_68_face_landmarks.dat")
-    if os.path.exists(dat_path):
-        return dat_path
-    
-    import urllib.request
-    import bz2
-
-    url      = "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2"
-    bz2_path = dat_path + ".bz2"
-
-    print("⬇️ Downloading shape_predictor_68_face_landmarks.dat...")
-    urllib.request.urlretrieve(url, bz2_path)
-
-    print("📦 Extracting...")
-    with bz2.open(bz2_path, "rb") as f_in, open(dat_path, "wb") as f_out:
-        f_out.write(f_in.read())
-    os.remove(bz2_path)
-
-    print("✅ shape_predictor siap")
-    return dat_path
-
-# Jalankan sebelum BASE_DIR
-LANDMARK_DAT = download_shape_predictor()
+# ─────────────────────────────────────────────
+# MEDIAPIPE — mapping dari dlib 68-point ke Face Mesh
+# ─────────────────────────────────────────────
+#
+# dlib idx → MediaPipe Face Mesh idx (approx equivalent)
+#   0  (jaw left)      → 234
+#   1  (jaw left+1)    → 227
+#   8  (chin)          → 152
+#  15  (jaw right-1)   → 447
+#  16  (jaw right)     → 454
+#  17  (brow left L)   → 70
+#  19  (brow left mid) → 66
+#  26  (brow right R)  → 296
+#  27  (nose bridge)   → 168
+#  28-35 (nose ridge)  → 168,6,197,195,5,4,1,2   (range 27-36)
+#  17-26 (both brows)  → mapped below
+#
+MP_LANDMARK_MAP = {
+    0:  234,   # jaw far left
+    1:  227,   # jaw left
+    8:  152,   # chin bottom
+    15: 447,   # jaw right
+    16: 454,   # jaw far right
+    17: 70,    # left brow outer
+    18: 63,
+    19: 66,    # left brow mid
+    20: 65,
+    21: 55,
+    22: 285,
+    23: 295,
+    24: 282,
+    25: 283,
+    26: 296,   # right brow outer
+    27: 168,   # nose bridge top
+    28: 6,
+    29: 197,
+    30: 195,
+    31: 5,
+    32: 4,
+    33: 1,
+    34: 19,
+    35: 94,    # nose tip
+}
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(BASE_DIR, "models")
 FOUNDATION_CSV = os.path.join(BASE_DIR, "foundation_mst_full_most_updated.csv")
 
-# Kolom fitur yang sama persis dengan training
 FEATURE_COLS = [
     'cheek_L_mean', 'cheek_L_std', 'cheek_a_mean', 'cheek_a_std',
     'cheek_b_mean', 'cheek_b_std', 'cheek_ITA',
@@ -61,16 +77,22 @@ FEATURE_COLS = [
 ]
 
 # ─────────────────────────────────────────────
-# LOAD MODEL (cached agar tidak reload tiap klik)
+# LOAD MODEL
 # ─────────────────────────────────────────────
 @st.cache_resource
 def load_resources():
-    detector   = dlib.get_frontal_face_detector()
-    predictor  = dlib.shape_predictor(LANDMARK_DAT)
-    ensemble   = joblib.load(f"{MODEL_DIR}/best_model.pkl")
-    scaler     = joblib.load(f"{MODEL_DIR}/scaler.pkl")
-    
-    # Cari file kmeans secara dinamis
+    # MediaPipe Face Mesh
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+    )
+
+    ensemble = joblib.load(f"{MODEL_DIR}/best_model.pkl")
+    scaler   = joblib.load(f"{MODEL_DIR}/scaler.pkl")
+
     kmeans_path = None
     for f in os.listdir(MODEL_DIR):
         if f.startswith("kmeans_k") and f.endswith(".pkl"):
@@ -79,9 +101,9 @@ def load_resources():
     if kmeans_path is None:
         raise FileNotFoundError("kmeans_k*.pkl tidak ditemukan di MODEL_DIR")
     kmeans = joblib.load(kmeans_path)
-    
-    df_found   = pd.read_csv(FOUNDATION_CSV)
-    centroids  = (
+
+    df_found  = pd.read_csv(FOUNDATION_CSV)
+    centroids = (
         df_found.groupby("mst_id")[["lab_L", "lab_a", "lab_b"]]
         .median()
         .rename(columns={"lab_L": "L_ref", "lab_a": "a_ref", "lab_b": "b_ref"})
@@ -92,44 +114,52 @@ def load_resources():
         .set_index("mst_id")["mst_hex"]
         .to_dict()
     )
-    return detector, predictor, ensemble, scaler, kmeans, df_found, centroids, mst_hex_lookup
+    return face_mesh, ensemble, scaler, kmeans, df_found, centroids, mst_hex_lookup
 
-
-import math
 
 # ─────────────────────────────────────────────
-# PREPROCESSING — identik dengan notebook
+# PREPROCESSING
 # ─────────────────────────────────────────────
 def preprocess_image(img):
-    """normalize → gaussian → wiener, sama persis dengan training."""
-    # CLAHE ringan
     lab   = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
-    clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(16, 16))  # ← fix
+    clahe = cv2.createCLAHE(clipLimit=1.0, tileGridSize=(16, 16))
     lab[:, :, 0] = clahe.apply(lab[:, :, 0])
     img_norm = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
-    # Gaussian
-    img_blur = cv2.GaussianBlur(img_norm, (5, 5), 1.0)             # ← fix ksize & sigma
-    # Wiener per channel
+    img_blur = cv2.GaussianBlur(img_norm, (5, 5), 1.0)
     result = np.zeros_like(img_blur, dtype=np.float32)
     for c in range(3):
-        result[:, :, c] = wiener(img_blur[:, :, c].astype(np.float32), mysize=5)  # ← fix
+        result[:, :, c] = wiener(img_blur[:, :, c].astype(np.float32), mysize=5)
     return np.clip(result, 0, 255).astype(np.uint8)
 
 
 # ─────────────────────────────────────────────
-# DETEKSI LANDMARK
+# DETEKSI LANDMARK (MediaPipe → dlib-style list)
 # ─────────────────────────────────────────────
-def detect_landmarks(img_rgb, detector, predictor):
-    gray  = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    faces = detector(gray, 1)
-    if len(faces) == 0:
-        faces = detector(gray, 0)   # upsample sekali lagi jika tidak ketemu
-    if len(faces) == 0:
+def detect_landmarks(img_rgb, face_mesh):
+    """
+    Mengembalikan:
+      lms  : list of (x, y) berindex 0–35, mapping dari dlib 68-point
+      bbox : tuple (x1, y1, x2, y2) bounding box wajah
+    """
+    results = face_mesh.process(img_rgb)
+    if not results.multi_face_landmarks:
         return None, None
-    face  = faces[0]
-    shape = predictor(gray, face)
-    lms   = [(shape.part(i).x, shape.part(i).y) for i in range(68)]
-    return lms, face
+
+    h, w    = img_rgb.shape[:2]
+    mp_lms  = results.multi_face_landmarks[0].landmark
+
+    # Buat list indexed 0–35 (sesuai dlib indices yang dipakai)
+    lms = {}
+    for dlib_idx, mp_idx in MP_LANDMARK_MAP.items():
+        pt = mp_lms[mp_idx]
+        lms[dlib_idx] = (int(pt.x * w), int(pt.y * h))
+
+    # Hitung bounding box dari semua landmark
+    xs = [p[0] for p in lms.values()]
+    ys = [p[1] for p in lms.values()]
+    bbox = (min(xs), min(ys), max(xs), max(ys))
+
+    return lms, bbox
 
 
 # ─────────────────────────────────────────────
@@ -167,7 +197,6 @@ def make_nose_mask(img_shape, landmarks):
     return mask.astype(bool)
 
 def filter_skin_pixels(lab_pixels):
-    """Filter pixel non-kulit — sama dengan notebook v3.1."""
     mask = (
         (lab_pixels[:, 0] >= 20) & (lab_pixels[:, 0] <= 97) &
         (lab_pixels[:, 1] >= 3)  & (lab_pixels[:, 1] <= 30)
@@ -176,7 +205,7 @@ def filter_skin_pixels(lab_pixels):
 
 
 # ─────────────────────────────────────────────
-# EKSTRAKSI FITUR — identik dengan notebook
+# EKSTRAKSI FITUR
 # ─────────────────────────────────────────────
 def get_skin_features(img_rgb, lms):
     from skimage.color import rgb2lab as skimage_rgb2lab
@@ -206,7 +235,7 @@ def get_skin_features(img_rgb, lms):
             feats[f'{zone_name}_{ch}_mean'] = float(px[:, ci].mean())
             feats[f'{zone_name}_{ch}_std']  = float(px[:, ci].std())
         feats[f'{zone_name}_ITA'] = math.degrees(
-            math.atan2(px[:, 0].mean(), px[:, 2].mean())  # atan2(L_mean, b_mean)
+            math.atan2(px[:, 0].mean(), px[:, 2].mean())
         )
 
     if not all_pixels:
@@ -223,7 +252,7 @@ def get_skin_features(img_rgb, lms):
 
 
 # ─────────────────────────────────────────────
-# PREDIKSI HYBRID — identik dengan notebook
+# PREDIKSI HYBRID
 # ─────────────────────────────────────────────
 def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
                         alpha=0.60, temperature=1.0, sigma_eucl=4.0, sigma_ita=8.0):
@@ -235,7 +264,6 @@ def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
     model_proba   = ensemble.predict_proba(x_aug)[0]
     model_classes = ensemble.classes_
 
-    # Temperature scaling
     log_p = np.log(model_proba + 1e-10) / temperature
     model_proba = np.exp(log_p - log_p.max())
     model_proba = model_proba / model_proba.sum()
@@ -288,7 +316,7 @@ def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
 
 
 # ─────────────────────────────────────────────
-# REKOMENDASI — identik dengan notebook
+# REKOMENDASI
 # ─────────────────────────────────────────────
 def recommend_foundation(mst_pred, L, a, b, df_found, top_n=5):
     df = df_found.copy()
@@ -304,9 +332,20 @@ def recommend_foundation(mst_pred, L, a, b, df_found, top_n=5):
 
 
 # ─────────────────────────────────────────────
+# HELPER: CIELAB → HEX
+# ─────────────────────────────────────────────
+def cielab_to_hex(L, a, b):
+    from skimage.color import lab2rgb
+    rgb = lab2rgb([[[ L, a, b ]]])[0][0]
+    rgb = np.clip(rgb, 0, 1)
+    r, g, b_ = int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)
+    return f"#{r:02x}{g:02x}{b_:02x}"
+
+
+# ─────────────────────────────────────────────
 # MAIN PIPELINE
 # ─────────────────────────────────────────────
-def run_pipeline(img_rgb, detector, predictor, ensemble, scaler,
+def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
                  kmeans, centroids, df_found, mst_hex_lookup, feature_cols):
     t0 = time.time()
 
@@ -315,8 +354,8 @@ def run_pipeline(img_rgb, detector, predictor, ensemble, scaler,
         scale   = 512 / max(h, w)
         img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)))
 
-    img_pre        = preprocess_image(img_rgb)
-    lms, face_rect = detect_landmarks(img_pre, detector, predictor)
+    img_pre      = preprocess_image(img_rgb)
+    lms, bbox    = detect_landmarks(img_pre, face_mesh)
 
     if lms is None:
         return None, "❌ Wajah tidak terdeteksi. Pastikan pencahayaan cukup dan wajah menghadap kamera."
@@ -340,10 +379,10 @@ def run_pipeline(img_rgb, detector, predictor, ensemble, scaler,
     latency = round((time.time() - t0) * 1000, 1)
 
     vis = img_rgb.copy()
-    if face_rect is not None:
-        x1, y1, x2, y2 = face_rect.left(), face_rect.top(), face_rect.right(), face_rect.bottom()
+    if bbox:
+        x1, y1, x2, y2 = bbox
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 200, 100), 2)
-    for (px, py) in lms:
+    for (px, py) in lms.values():
         cv2.circle(vis, (int(px), int(py)), 1, (255, 100, 0), -1)
 
     return {
@@ -366,6 +405,7 @@ def run_pipeline(img_rgb, detector, predictor, ensemble, scaler,
         "vis_frame" : vis,
     }, None
 
+
 # ─────────────────────────────────────────────
 # STREAMLIT UI
 # ─────────────────────────────────────────────
@@ -379,17 +419,15 @@ def main():
     st.title("🎨 Foundation Shade Detector")
     st.caption("Monk Skin Tone (MST) Detection + Rekomendasi Foundation via Webcam")
 
-    # ── Load resources ──
     with st.spinner("Memuat model & database foundation..."):
         try:
-            (detector, predictor, ensemble, scaler,
+            (face_mesh, ensemble, scaler,
              kmeans, df_found, centroids, mst_hex_lookup) = load_resources()
             st.success(f"✅ Model siap | Foundation DB: {len(df_found)} produk")
         except Exception as e:
             st.error(f"❌ Gagal load model: {e}")
             st.stop()
 
-    # ── Sidebar: info & settings ──
     with st.sidebar:
         st.header("ℹ️ Petunjuk")
         st.markdown("""
@@ -403,8 +441,7 @@ def main():
         st.markdown("**Tentang MST (Monk Skin Tone)**")
         st.markdown("Skala 1–10 untuk mengukur warna kulit secara inklusif, "
                     "dikembangkan oleh Dr. Ellis Monk (Google).")
-        
-        # Warna referensi MST
+
         st.markdown("**Referensi Warna MST:**")
         mst_colors = {
             1: "#f6ede4", 2: "#f3e7db", 3: "#f7ead0", 4: "#eadaba",
@@ -422,7 +459,6 @@ def main():
                     unsafe_allow_html=True
                 )
 
-    # ── Webcam input ──
     st.subheader("📷 Kamera")
     camera_image = st.camera_input(
         "Ambil foto wajah",
@@ -430,7 +466,6 @@ def main():
     )
 
     if camera_image is not None:
-        # Decode gambar dari file upload
         file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
         img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -439,26 +474,22 @@ def main():
 
         with st.spinner("Menganalisis wajah..."):
             result, error = run_pipeline(
-                img_rgb, detector, predictor, ensemble, scaler,
+                img_rgb, face_mesh, ensemble, scaler,
                 kmeans, centroids, df_found, mst_hex_lookup, FEATURE_COLS
             )
 
         if error:
             st.warning(error)
         else:
-            # ── Layout hasil: 3 kolom ──
             col1, col2, col3 = st.columns([1.2, 1, 1.5])
 
-            # Kolom 1: foto dengan landmark
             with col1:
                 st.markdown("**Frame + Landmark**")
                 st.image(result["vis_frame"], use_column_width=True)
 
-            # Kolom 2: swatch warna + MST info
             with col2:
                 st.markdown("**Prediksi MST**")
 
-                # Swatch warna kulit
                 skin_hex = cielab_to_hex(
                     result["cielab"]["L"],
                     result["cielab"]["a"],
@@ -470,16 +501,12 @@ def main():
                     f'<p style="text-align:center;font-size:12px;margin-top:0">Warna Kulit Terdeteksi<br>{skin_hex}</p>',
                     unsafe_allow_html=True
                 )
-
-                # Swatch foundation rekomendasi
                 st.markdown(
                     f'<div style="background:{result["hex_color"]};border-radius:10px;'
                     f'height:50px;margin-bottom:6px;border:1px solid #ccc"></div>'
                     f'<p style="text-align:center;font-size:12px;margin-top:0">Foundation Cocok<br>{result["hex_color"]}</p>',
                     unsafe_allow_html=True
                 )
-
-                # MST badge
                 st.markdown(
                     f'<div style="text-align:center;background:#f0f0f0;'
                     f'border-radius:12px;padding:12px;margin:8px 0">'
@@ -489,8 +516,7 @@ def main():
                     unsafe_allow_html=True
                 )
 
-                # Confidence bar
-                conf_pct = result["confidence"]
+                conf_pct  = result["confidence"]
                 bar_color = "#2e8b57" if conf_pct >= 60 else "#e07b39" if conf_pct >= 40 else "#cc2222"
                 st.markdown(
                     f'<div style="background:#eee;border-radius:6px;height:12px;overflow:hidden">'
@@ -499,7 +525,6 @@ def main():
                     unsafe_allow_html=True
                 )
 
-                # Top-3 alternatif
                 st.markdown("**Top-3 Alternatif MST:**")
                 for t in result["top3"]:
                     hex_c = t["hex"]
@@ -512,7 +537,6 @@ def main():
                         unsafe_allow_html=True
                     )
 
-            # Kolom 3: detail rekomendasi + CIELAB
             with col3:
                 st.markdown("**Rekomendasi Foundation**")
                 st.markdown(f"""
@@ -539,7 +563,6 @@ def main():
                 df_recs["ΔE"] = df_recs["ΔE"].round(2)
                 st.dataframe(df_recs, use_container_width=True, hide_index=True)
 
-            # ── Info latency di bawah ──
             st.caption(f"⏱️ Waktu analisis: {result['latency_ms']} ms")
 
 
