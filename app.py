@@ -97,7 +97,9 @@ def load_resources():
     options = mp_vision.FaceLandmarkerOptions(
         base_options=base_options,
         num_faces=1,
-        min_face_detection_confidence=0.5,
+        min_face_detection_confidence=0.3,
+        min_face_presence_confidence=0.3,
+        min_tracking_confidence=0.3,
     )
     face_mesh = mp_vision.FaceLandmarker.create_from_options(options)
 
@@ -360,8 +362,12 @@ def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
         scale   = 512 / max(h, w)
         img_rgb = cv2.resize(img_rgb, (int(w * scale), int(h * scale)))
 
-    img_pre      = preprocess_image(img_rgb)
-    lms, bbox    = detect_landmarks(img_pre, face_mesh)
+    lms, bbox = detect_landmarks(img_rgb, face_mesh)
+    if lms is None:
+        img_pre = preprocess_image(img_rgb)
+        lms, bbox = detect_landmarks(img_pre, face_mesh)
+    else:
+        img_pre = preprocess_image(img_rgb)
 
     if lms is None:
         return None, "❌ Wajah tidak terdeteksi. Pastikan pencahayaan cukup dan wajah menghadap kamera."
