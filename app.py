@@ -4,7 +4,9 @@
 import streamlit as st
 import numpy as np
 import cv2
-import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
+import urllib.request
 import joblib
 import os
 import time
@@ -34,6 +36,14 @@ import pandas as pd
 #  28-35 (nose ridge)  → 168,6,197,195,5,4,1,2   (range 27-36)
 #  17-26 (both brows)  → mapped below
 #
+
+def download_face_landmarker():
+    model_path = "/tmp/face_landmarker.task"
+    if not os.path.exists(model_path):
+        url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+        urllib.request.urlretrieve(url, model_path)
+    return model_path
+    
 MP_LANDMARK_MAP = {
     0:  234,   # jaw far left
     1:  227,   # jaw left
@@ -82,13 +92,14 @@ FEATURE_COLS = [
 @st.cache_resource
 def load_resources():
     # MediaPipe Face Mesh
-    mp_face_mesh_module = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh_module.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
+    model_path = download_face_landmarker()
+    base_options = mp_tasks.BaseOptions(model_asset_path=model_path)
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
     )
+    face_mesh = mp_vision.FaceLandmarker.create_from_options(options)
 
     ensemble = joblib.load(f"{MODEL_DIR}/best_model.pkl")
     scaler   = joblib.load(f"{MODEL_DIR}/scaler.pkl")
@@ -136,25 +147,20 @@ def preprocess_image(img):
 # DETEKSI LANDMARK (MediaPipe → dlib-style list)
 # ─────────────────────────────────────────────
 def detect_landmarks(img_rgb, face_mesh):
-    """
-    Mengembalikan:
-      lms  : list of (x, y) berindex 0–35, mapping dari dlib 68-point
-      bbox : tuple (x1, y1, x2, y2) bounding box wajah
-    """
-    results = face_mesh.process(img_rgb)
-    if not results.multi_face_landmarks:
+    import mediapipe as mp_lib
+    h, w = img_rgb.shape[:2]
+    mp_image = mp_lib.Image(image_format=mp_lib.ImageFormat.SRGB, data=img_rgb)
+    results = face_mesh.detect(mp_image)
+    if not results.face_landmarks:
         return None, None
 
-    h, w    = img_rgb.shape[:2]
-    mp_lms  = results.multi_face_landmarks[0].landmark
+    mp_lms = results.face_landmarks[0]
 
-    # Buat list indexed 0–35 (sesuai dlib indices yang dipakai)
     lms = {}
     for dlib_idx, mp_idx in MP_LANDMARK_MAP.items():
         pt = mp_lms[mp_idx]
         lms[dlib_idx] = (int(pt.x * w), int(pt.y * h))
 
-    # Hitung bounding box dari semua landmark
     xs = [p[0] for p in lms.values()]
     ys = [p[1] for p in lms.values()]
     bbox = (min(xs), min(ys), max(xs), max(ys))
