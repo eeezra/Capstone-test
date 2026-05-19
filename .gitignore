@@ -1,0 +1,23 @@
+# dlib model — didownload otomatis oleh app.py
+*.dat
+*.dat.bz2
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment (kalau kamu test di lokal)
+venv/
+env/
+.env/
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Streamlit local config
+.streamlit/secrets.toml
