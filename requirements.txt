@@ -2,9 +2,9 @@ streamlit
 numpy
 pandas
 opencv-python-headless
-dlib
 scikit-learn
 scikit-image
 scipy
 joblib
 Pillow
+dlib==19.24.2
