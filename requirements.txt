@@ -1,11 +1,10 @@
 streamlit
-numpy<2
+numpy
 pandas
-opencv-python-headless==4.8.1.78
-opencv-contrib-python-headless==4.8.1.78
-scikit-learn==1.6.1
-scikit-image==0.22.0
-scipy
+opencv-python-headless
+mediapipe
 joblib
 Pillow
-mediapipe==0.10.35
+scipy
+scikit-image
+scikit-learn
