@@ -834,6 +834,13 @@ def main():
                             {result["hex_color"]}
                         </div>
                     </div>
+                    <div style="
+                        margin-top:14px;
+                        font-size:20px;
+                        font-weight:750;
+                        color:inherit;">
+                        Undertone: {result["user_undertone"]} | Skintone: {result["user_skintone"]}
+                    </div>
                     """,
                     unsafe_allow_html=True
                 )
