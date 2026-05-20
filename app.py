@@ -78,7 +78,7 @@ MP_LANDMARK_MAP = {
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(BASE_DIR, "models")
-FOUNDATION_CSV = os.path.join(BASE_DIR, "foundation_mst.csv")
+FOUNDATION_CSV = os.path.join(BASE_DIR, "foundation_mst_full_most_updated.csv")
 
 FEATURE_COLS = [
     'cheek_L_mean', 'cheek_L_std', 'cheek_a_mean', 'cheek_a_std',
