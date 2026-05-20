@@ -1,6 +1,3 @@
-# app.py
-# Jalankan dengan: streamlit run app.py
-
 import streamlit as st
 import numpy as np
 import cv2
@@ -18,6 +15,9 @@ from skimage.color import rgb2lab
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 import pandas as pd
+from PIL import ImageDraw, ImageFont
+import tempfile
+from datetime import datetime
 
 # ─────────────────────────────────────────────
 # MEDIAPIPE — mapping dari dlib 68-point ke Face Mesh
@@ -38,10 +38,15 @@ import pandas as pd
 #
 
 def download_face_landmarker():
-    model_path = "/tmp/face_landmarker.task"
+    model_dir = os.path.join(BASE_DIR, "models")
+    os.makedirs(model_dir, exist_ok=True)
+
+    model_path = os.path.join(model_dir, "face_landmarker.task")
+
     if not os.path.exists(model_path):
         url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
         urllib.request.urlretrieve(url, model_path)
+
     return model_path
     
 MP_LANDMARK_MAP = {
@@ -73,7 +78,7 @@ MP_LANDMARK_MAP = {
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR      = os.path.join(BASE_DIR, "models")
-FOUNDATION_CSV = os.path.join(BASE_DIR, "foundation_mst_full_most_updated.csv")
+FOUNDATION_CSV = os.path.join(BASE_DIR, "foundation_mst.csv")
 
 FEATURE_COLS = [
     'cheek_L_mean', 'cheek_L_std', 'cheek_a_mean', 'cheek_a_std',
@@ -247,8 +252,10 @@ def get_skin_features(img_rgb, lms):
         for ci, ch in enumerate(['L', 'a', 'b']):
             feats[f'{zone_name}_{ch}_mean'] = float(px[:, ci].mean())
             feats[f'{zone_name}_{ch}_std']  = float(px[:, ci].std())
+        # FIX Bug 1: Formula ITA yang benar adalah atan2(L - 50, b)
+        # L dikurangi 50 sesuai standar ilmiah ITA dan konsisten dengan predict_mst_hybrid()
         feats[f'{zone_name}_ITA'] = math.degrees(
-            math.atan2(px[:, 0].mean(), px[:, 2].mean())
+            math.atan2(px[:, 0].mean() - 50, px[:, 2].mean())
         )
 
     if not all_pixels:
@@ -258,8 +265,9 @@ def get_skin_features(img_rgb, lms):
     for ci, ch in enumerate(['L', 'a', 'b']):
         feats[f'global_{ch}_mean'] = float(combined[:, ci].mean())
         feats[f'global_{ch}_std']  = float(combined[:, ci].std())
+    # FIX Bug 1: Formula ITA global juga harus L - 50
     feats['global_ITA'] = math.degrees(
-        math.atan2(combined[:, 0].mean(), combined[:, 2].mean())
+        math.atan2(combined[:, 0].mean() - 50, combined[:, 2].mean())
     )
     return feats
 
@@ -268,7 +276,7 @@ def get_skin_features(img_rgb, lms):
 # PREDIKSI HYBRID
 # ─────────────────────────────────────────────
 def predict_mst_hybrid(feats, ensemble, scaler, kmeans, centroids, feature_cols,
-                        alpha=0.60, temperature=1.0, sigma_eucl=4.0, sigma_ita=8.0):
+                        alpha=0.40, temperature=0.6, sigma_eucl=2.0, sigma_ita=4.0):
     x    = np.array([[feats.get(c, 0.0) for c in feature_cols]])
     x_sc = scaler.transform(x)
     dist = kmeans.transform(x_sc)
@@ -354,6 +362,12 @@ def cielab_to_hex(L, a, b):
     r, g, b_ = int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)
     return f"#{r:02x}{g:02x}{b_:02x}"
 
+def format_rupiah(value):
+    try:
+        value = float(value)
+        return f"Rp{value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except:
+        return value
 
 # ─────────────────────────────────────────────
 # MAIN PIPELINE
@@ -406,6 +420,12 @@ def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
     for (px, py) in lms.values():
         cv2.circle(vis, (int(px), int(py)), 1, (255, 100, 0), -1)
 
+    skin_hex = cielab_to_hex(
+    feats["global_L_mean"],
+    feats["global_a_mean"],
+    feats["global_b_mean"]
+    )
+    
     return {
         "mst_pred"  : mst,
         "confidence": conf,
@@ -413,9 +433,13 @@ def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
         "shade_name": top_rec["Shade"],
         "brand"     : top_rec["Brand"],
         "product"   : top_rec["Product"],
-        "hex_color" : top_rec["mst_hex"],
+        # FIX Bug 2: Gunakan warna LAB spesifik shade produk, bukan warna rata-rata grup MST.
+        # mst_hex adalah warna representatif seluruh grup MST yang sama untuk semua produk
+        # dalam grup tersebut, sehingga tidak mencerminkan warna shade yang direkomendasikan.
+        "hex_color" : cielab_to_hex(top_rec["lab_L"], top_rec["lab_a"], top_rec["lab_b"]),
+        "skin_hex"  : skin_hex,
         "undertone" : top_rec["Undertone"],
-        "delta_e"   : round(top_rec["delta_e"], 2),
+        "price"     : format_rupiah(top_rec["Price"]),
         "top5_recs" : recs.to_dict(orient="records"),
         "cielab"    : {
             "L": round(feats["global_L_mean"], 2),
@@ -425,7 +449,124 @@ def run_pipeline(img_rgb, face_mesh, ensemble, scaler,
         "latency_ms": latency,
         "vis_frame" : vis,
     }, None
+def load_font(size, bold=False):
+    paths = [
+        "arialbd.ttf" if bold else "arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
 
+    for p in paths:
+        try:
+            return ImageFont.truetype(p, size)
+        except:
+            continue
+
+    return ImageFont.load_default()
+
+def create_analysis_report(result):
+    # Canvas report
+    W, H = 1400, 1000
+    bg = (255, 255, 255)
+    img = Image.new("RGB", (W, H), bg)
+    draw = ImageDraw.Draw(img)
+
+    # Font fallback
+    try:
+        font_title = load_font(42, bold=True)
+        font_h1 = load_font(34, bold=True)
+        font_h2 = load_font(28, bold=True)
+        font_text = load_font(24)
+        font_small = load_font(21)
+        font_table = load_font(20)
+        font_big = load_font(54, bold=True)
+    except:
+        font_title = ImageFont.load_default()
+        font_h2 = ImageFont.load_default()
+        font_text = ImageFont.load_default()
+        font_small = ImageFont.load_default()
+        font_big = ImageFont.load_default()
+
+    # Title
+    draw.text((50, 35), "Foundation Shade Detector - Hasil Analisis", fill=(30, 30, 30), font=font_title)
+
+    # Frame landmark
+    frame = Image.fromarray(result["vis_frame"]).convert("RGB")
+    frame.thumbnail((520, 380))
+    draw.text((50, 115), "Frame + Landmark", fill=(30, 30, 30), font=font_h2)
+    img.paste(frame, (50, 165))
+
+    # Prediksi MST
+    x = 630
+    y = 115
+    draw.text((x, y), "Prediksi MST", fill=(30, 30, 30), font=font_h2)
+
+    # Color boxes
+    skin_hex = result.get("skin_hex", "")
+    detected_hex = skin_hex if skin_hex else "-"
+    foundation_hex = result["hex_color"]
+
+    draw.text((x, y + 60), "Warna Kulit Terdeteksi", fill=(40, 40, 40), font=font_text)
+    draw.rounded_rectangle((x, y + 100, x + 260, y + 150), radius=12, fill=detected_hex if detected_hex != "-" else "#cccccc", outline=(200, 200, 200))
+    draw.text((x + 285, y + 112), detected_hex, fill=(40, 40, 40), font=font_text)
+
+    draw.text((x, y + 180), "Foundation Cocok", fill=(40, 40, 40), font=font_text)
+    draw.rounded_rectangle((x, y + 220, x + 260, y + 270), radius=12, fill=foundation_hex, outline=(200, 200, 200))
+    draw.text((x + 285, y + 232), foundation_hex, fill=(40, 40, 40), font=font_text)
+
+    # MST card
+    card_x = 1050
+    card_y = 175
+    draw.rounded_rectangle((card_x, card_y, card_x + 280, card_y + 150), radius=20, fill=(245, 245, 245), outline=(220, 220, 220))
+    draw.text((card_x + 55, card_y + 35), f"MST {result['mst_pred']}", fill=(25, 25, 25), font=font_big)
+    draw.text((card_x + 55, card_y + 105), f"Confidence: {result['confidence']}%", fill=(80, 80, 80), font=font_small)
+
+    # Top 3
+    draw.text((1050, 360), "Top-3 Alternatif MST", fill=(40, 40, 40), font=font_text)
+    yy = 405
+    for t in result["top3"]:
+        draw.rounded_rectangle((1050, yy, 1085, yy + 35), radius=6, fill=t["hex"], outline=(180, 180, 180))
+        draw.text((1100, yy + 3), f"MST {t['mst']} - {t['conf']}%", fill=(40, 40, 40), font=font_small)
+        yy += 48
+
+    # CIELAB
+    draw.text((630, 470), "Nilai CIELAB Kulit", fill=(30, 30, 30), font=font_h2)
+    draw.text((630, 525), f"L*  : {result['cielab']['L']}", fill=(40, 40, 40), font=font_text)
+    draw.text((830, 525), f"a*  : {result['cielab']['a']}", fill=(40, 40, 40), font=font_text)
+    draw.text((1030, 525), f"b*  : {result['cielab']['b']}", fill=(40, 40, 40), font=font_text)
+
+    # Rekomendasi utama
+    y2 = 620
+    draw.line((50, y2 - 30, 1350, y2 - 30), fill=(220, 220, 220), width=2)
+    draw.text((50, y2), "Rekomendasi Foundation", fill=(30, 30, 30), font=font_h2)
+
+    rec_lines = [
+        f"Brand      : {result['brand']}",
+        f"Produk     : {result['product']}",
+        f"Shade      : {result['shade_name']}",
+        f"Undertone  : {result['undertone']}",
+        f"Price      : {result['price']}",
+    ]
+
+    yy = y2 + 55
+    for line in rec_lines:
+        draw.text((50, yy), line, fill=(40, 40, 40), font=font_text)
+        yy += 38
+
+    # Top 5
+    draw.text((700, y2), "Top-5 Rekomendasi Foundation", fill=(30, 30, 30), font=font_h2)
+    yy = y2 + 55
+
+    for i, rec in enumerate(result["top5_recs"][:5], start=1):
+        brand = str(rec.get("Brand", "-"))
+        shade = str(rec.get("Shade", "-"))
+        undertone = str(rec.get("Undertone", "-"))
+        price = format_rupiah(rec.get("Price", "-"))
+
+        line = f"{i}. {brand} | {shade} | {undertone} | {price}"
+        draw.text((700, yy), line[:55], fill=(40, 40, 40), font=font_small)
+        yy += 40
+
+    return img
 
 # ─────────────────────────────────────────────
 # STREAMLIT UI
@@ -435,6 +576,18 @@ def main():
         page_title="Foundation Shade Detector",
         page_icon="🎨",
         layout="wide",
+    )
+
+    st.markdown(
+    """
+    <style>
+    [data-testid="stCameraInput"] video,
+    [data-testid="stCameraInput"] img {
+        transform: scaleX(-1);
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
     )
 
     st.title("🎨 Foundation Shade Detector")
@@ -480,16 +633,37 @@ def main():
                     unsafe_allow_html=True
                 )
 
-    st.subheader("📷 Kamera")
-    camera_image = st.camera_input(
-        "Ambil foto wajah",
-        help="Klik tombol kamera di bawah preview untuk mengambil foto"
+    st.subheader("📷 Input Foto")
+
+    input_mode = st.radio(
+        "Pilih metode input:",
+        ["Kamera", "Upload Foto"],
+        horizontal=True
     )
 
-    if camera_image is not None:
-        file_bytes = np.asarray(bytearray(camera_image.read()), dtype=np.uint8)
+    camera_image = None
+    uploaded_image = None
+
+    if input_mode == "Kamera":
+        camera_image = st.camera_input(
+            "Ambil foto wajah",
+            help="Izinkan akses kamera di browser jika diminta"
+        )
+    else:
+        uploaded_image = st.file_uploader(
+            "Upload foto wajah",
+            type=["jpg", "jpeg", "png"]
+        )
+
+    image_source = camera_image if camera_image is not None else uploaded_image
+
+    if image_source is not None:
+        file_bytes = np.asarray(bytearray(image_source.read()), dtype=np.uint8)
         img_bgr    = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
         img_rgb    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+        if input_mode == "Kamera":
+            img_rgb = cv2.flip(img_rgb, 1)
 
         st.subheader("🔍 Hasil Analisis")
 
@@ -502,64 +676,218 @@ def main():
         if error:
             st.warning(error)
         else:
-            col1, col2, col3 = st.columns([1.2, 1, 1.5])
+            # =========================
+            # ROW 1: GAMBAR + PREDIKSI
+            # =========================
+            left_col, right_col = st.columns([1.15, 1.85], gap="large")
 
-            with col1:
-                st.markdown("**Frame + Landmark**")
-                st.image(result["vis_frame"], use_column_width=True)
+            with left_col:
+                st.markdown("### Frame + Landmark")
+                st.image(result["vis_frame"], width="stretch")
 
-            with col2:
-                st.markdown("**Prediksi MST**")
+            with right_col:
+                st.markdown("### Prediksi MST")
 
                 skin_hex = cielab_to_hex(
                     result["cielab"]["L"],
                     result["cielab"]["a"],
                     result["cielab"]["b"]
                 )
+
+                pred_left, pred_right = st.columns([1.12, 1], gap="medium")
+
+                # =========================
+                # KIRI: WARNA KULIT + FOUNDATION
+                # =========================
+            with pred_left:
                 st.markdown(
-                    f'<div style="background:{skin_hex};border-radius:10px;'
-                    f'height:50px;margin-bottom:6px;border:1px solid #ccc"></div>'
-                    f'<p style="text-align:center;font-size:12px;margin-top:0">Warna Kulit Terdeteksi<br>{skin_hex}</p>',
-                    unsafe_allow_html=True
-                )
-                st.markdown(
-                    f'<div style="background:{result["hex_color"]};border-radius:10px;'
-                    f'height:50px;margin-bottom:6px;border:1px solid #ccc"></div>'
-                    f'<p style="text-align:center;font-size:12px;margin-top:0">Foundation Cocok<br>{result["hex_color"]}</p>',
-                    unsafe_allow_html=True
-                )
-                st.markdown(
-                    f'<div style="text-align:center;background:#f0f0f0;'
-                    f'border-radius:12px;padding:12px;margin:8px 0">'
-                    f'<span style="font-size:36px;font-weight:bold">MST {result["mst_pred"]}</span><br>'
-                    f'<span style="font-size:14px;color:#666">Confidence: {result["confidence"]}%</span>'
-                    f'</div>',
+                    f"""
+                    <div style="font-size:17px;font-weight:700;margin-bottom:6px;color:inherit;">
+                        Warna Kulit Terdeteksi
+                    </div>
+
+                    <div style="
+                        display:flex;
+                        align-items:center;
+                        gap:12px;
+                        margin-bottom:18px;">
+                        <div style="
+                            background:{skin_hex};
+                            border-radius:8px;
+                            height:38px;
+                            width:58%;
+                            border:1px solid rgba(128,128,128,0.4);">
+                        </div>
+                        <div style="
+                            font-size:17px;
+                            font-weight:700;
+                            color:inherit;">
+                            {skin_hex}
+                        </div>
+                    </div>
+
+                    <div style="font-size:17px;font-weight:700;margin-bottom:6px;color:inherit;">
+                        Foundation Cocok
+                    </div>
+
+                    <div style="
+                        display:flex;
+                        align-items:center;
+                        gap:12px;">
+                        <div style="
+                            background:{result["hex_color"]};
+                            border-radius:8px;
+                            height:44px;
+                            width:58%;
+                            border:1px solid rgba(128,128,128,0.4);">
+                        </div>
+                        <div style="
+                            font-size:17px;
+                            font-weight:700;
+                            color:inherit;">
+                            {result["hex_color"]}
+                        </div>
+                    </div>
+                    """,
                     unsafe_allow_html=True
                 )
 
-                conf_pct  = result["confidence"]
-                bar_color = "#2e8b57" if conf_pct >= 60 else "#e07b39" if conf_pct >= 40 else "#cc2222"
-                st.markdown(
-                    f'<div style="background:#eee;border-radius:6px;height:12px;overflow:hidden">'
-                    f'<div style="background:{bar_color};width:{conf_pct}%;height:100%;border-radius:6px"></div>'
-                    f'</div>',
-                    unsafe_allow_html=True
-                )
+                # =========================
+                # KANAN: MST + TOP 3
+                # =========================
+                with pred_right:
+                    conf_pct = result["confidence"]
+                    bar_color = "#2e8b57" if conf_pct >= 60 else "#e07b39" if conf_pct >= 40 else "#cc2222"
 
-                st.markdown("**Top-3 Alternatif MST:**")
-                for t in result["top3"]:
-                    hex_c = t["hex"]
                     st.markdown(
-                        f'<div style="display:flex;align-items:center;gap:8px;margin:4px 0">'
-                        f'<div style="background:{hex_c};width:28px;height:28px;border-radius:5px;'
-                        f'flex-shrink:0;border:1px solid #ccc"></div>'
-                        f'<span style="font-size:13px">MST {t["mst"]} — {t["conf"]}%</span>'
-                        f'</div>',
+                        f"""
+                        <div style="
+                            background:rgba(128,128,128,0.12);
+                            border-radius:12px;
+                            padding:15px 12px;
+                            text-align:center;
+                            border:1px solid rgba(128,128,128,0.25);
+                            margin-bottom:6px;">
+                            <div style="
+                                font-size:38px;
+                                font-weight:800;
+                                line-height:1;
+                                color:inherit;">
+                                MST {result["mst_pred"]}
+                            </div>
+                            <div style="
+                                font-size:17px;
+                                color:inherit;
+                                opacity:0.7;
+                                margin-top:5px;">
+                                Confidence: {result["confidence"]}%
+                            </div>
+                        </div>
+
+                        <div style="
+                            background:rgba(128,128,128,0.2);
+                            border-radius:999px;
+                            height:6px;
+                            overflow:hidden;
+                            margin-bottom:8px;">
+                            <div style="
+                                background:{bar_color};
+                                width:{conf_pct}%;
+                                height:100%;
+                                border-radius:999px;">
+                            </div>
+                        </div>
+
+                        <div style="
+                            font-size:17px;
+                            font-weight:700;
+                            margin-bottom:4px;
+                            color:inherit;">
+                            Top 3 Alternatif MST
+                        </div>
+                        """,
                         unsafe_allow_html=True
                     )
 
-            with col3:
-                st.markdown("**Rekomendasi Foundation**")
+                    for t in result["top3"]:
+                        hex_c = t["hex"]
+                        st.markdown(
+                            f"""
+                            <div style="
+                                display:flex;
+                                align-items:center;
+                                gap:7px;
+                                margin:3px 0;">
+                                <div style="
+                                    background:{hex_c};
+                                    width:30px;
+                                    height:30px;
+                                    border-radius:5px;
+                                    border:1px solid rgba(128,128,128,0.4);
+                                    flex-shrink:0;">
+                                </div>
+                                <span style="font-size:17px;color:inherit;">
+                                    MST {t["mst"]} — {t["conf"]}%
+                                </span>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+
+                # =========================
+                # CIELAB COMPACT
+                # =========================
+                st.markdown(
+                    f"""
+                    <div style="
+                        margin-top:12px;
+                        padding-top:10px;
+                        border-top:1px solid rgba(128,128,128,0.3);">
+                        <div style="
+                            font-size:23px;
+                            font-weight:800;
+                            margin-bottom:8px;
+                            color:inherit;">
+                            Nilai CIELAB Kulit
+                        </div>
+                        <div style="
+                            display:grid;
+                            grid-template-columns:repeat(3, 1fr);
+                            gap:10px;">
+                            <div>
+                                <div style="font-size:15px;opacity:0.6;color:inherit;">L* (kecerahan)</div>
+                                <div style="font-size:24px;font-weight:500;line-height:1.1;color:inherit;">
+                                    {result["cielab"]["L"]}
+                                </div>
+                            </div>
+                            <div>
+                                <div style="font-size:15px;opacity:0.6;color:inherit;">a* (merah-hijau)</div>
+                                <div style="font-size:24px;font-weight:500;line-height:1.1;color:inherit;">
+                                    {result["cielab"]["a"]}
+                                </div>
+                            </div>
+                            <div>
+                                <div style="font-size:15px;opacity:0.6;color:inherit;">b* (kuning-biru)</div>
+                                <div style="font-size:24px;font-weight:500;line-height:1.1;color:inherit;">
+                                    {result["cielab"]["b"]}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+            st.markdown("---")
+
+            # ==========================================
+            # ROW 2: REKOMENDASI UTAMA + TOP 5 PRODUK
+            # ==========================================
+            rec_col, top5_col = st.columns([1.1, 1.6], gap="large")
+
+            with rec_col:
+                st.markdown("### Rekomendasi Foundation")
+
                 st.markdown(f"""
                 | Info | Detail |
                 |------|--------|
@@ -567,22 +895,39 @@ def main():
                 | 💄 Produk | {result['product']} |
                 | 🎨 Shade | **{result['shade_name']}** |
                 | 🌡️ Undertone | {result['undertone']} |
-                | 📐 Delta E | {result['delta_e']} |
-                | ⚡ Latency | {result['latency_ms']} ms |
+                | 💰 Price | {result['price']} |
                 """)
 
-                st.markdown("**Nilai CIELAB Kulit:**")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("L* (kecerahan)", result["cielab"]["L"])
-                c2.metric("a* (merah-hijau)", result["cielab"]["a"])
-                c3.metric("b* (kuning-biru)", result["cielab"]["b"])
+            with top5_col:
+                st.markdown("### Top-5 Rekomendasi Foundation")
 
-                st.markdown("**Top-5 Rekomendasi Foundation:**")
                 df_recs = pd.DataFrame(result["top5_recs"])[
-                    ["Brand", "Product", "Shade", "Undertone", "delta_e"]
-                ].rename(columns={"delta_e": "ΔE"})
-                df_recs["ΔE"] = df_recs["ΔE"].round(2)
-                st.dataframe(df_recs, use_container_width=True, hide_index=True)
+                    ["Brand", "Product", "Shade", "Undertone", "Price"]
+                ]
+
+                df_recs["Price"] = df_recs["Price"].apply(format_rupiah)
+
+                st.dataframe(
+                    df_recs,
+                    width="stretch",
+                    hide_index=True
+                )
+
+                report_img = create_analysis_report(result)
+
+                buffer = BytesIO()
+                report_img.save(buffer, format="PNG")
+                buffer.seek(0)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                st.download_button(
+                    label="📥 Download Hasil Analisis",
+                    data=buffer,
+                    file_name=f"hasil_analisis_foundation_{timestamp}.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
 
             st.caption(f"⏱️ Waktu analisis: {result['latency_ms']} ms")
 
